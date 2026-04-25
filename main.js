@@ -27,6 +27,8 @@ const SLASH_COMMANDS = [
     { name: "/mode", desc: "切换检索模式 (auto/wiki/...)" },
     { name: "/ask", desc: "强制 Wiki 增强检索提问" },
     { name: "/resume", desc: "恢复上一次的历史对话" },
+    { name: "/memdraft", desc: "将本轮对话整理为 Wiki 草稿" },
+    { name: "/memsave", desc: "将整理好的草稿保存到本地 raw/faq" },
     { name: "/reset", desc: "彻底清空当前屏幕与记忆" },
     { name: "/help", desc: "显示全量命令使用手册" }
 ];
@@ -39,6 +41,9 @@ class WikicodianView extends obsidian.ItemView {
         this.suggestIndex = -1;
         this.filteredCommands = [];
         this.chatMode = "auto";
+        this.currentDraft = { title: "", content: "" };
+        this.inputHistory = [];
+        this.historyIndex = -1;
     }
 
     getViewType() { return VIEW_TYPE_WIKICODIAN; }
@@ -58,6 +63,23 @@ class WikicodianView extends obsidian.ItemView {
         const syncBtn = statusBar.createEl('button', { text: 'Sync Wiki', cls: 'mod-cta' });
         syncBtn.onclick = () => this.executeSlashCommand("/sync");
 
+        const draftBtn = statusBar.createEl('button', { text: '整理记录', cls: 'mod-cta' });
+        draftBtn.onclick = () => this.handleMemDraft();
+
+        const saveBtn = statusBar.createEl('button', { text: '入库', cls: 'mod-cta' });
+        saveBtn.onclick = () => this.handleMemSave();
+
+        const modeToggle = statusBar.createEl('button', { 
+            text: `Mode: ${this.chatMode.toUpperCase()}`, 
+            cls: 'wikicodian-mode-toggle' 
+        });
+        modeToggle.onclick = () => {
+            this.chatMode = this.chatMode === "build" ? "auto" : "build";
+            modeToggle.setText(`Mode: ${this.chatMode.toUpperCase()}`);
+            modeToggle.toggleClass('is-build', this.chatMode === "build");
+            new obsidian.Notice(`已切换到 ${this.chatMode.toUpperCase()} 模式`);
+        };
+
         this.messageContainer = container.createEl('div', { cls: 'wikicodian-chat-messages' });
         this.suggestContainer = container.createEl('div', { cls: 'wikicodian-suggest-container' });
         this.suggestContainer.style.display = 'none';
@@ -74,10 +96,22 @@ class WikicodianView extends obsidian.ItemView {
             if (!query) return;
             if (query.startsWith("/")) {
                 this.executeSlashCommand(query);
+                // 记录历史
+                if (this.inputHistory[0] !== query) {
+                    this.inputHistory.unshift(query);
+                    if (this.inputHistory.length > 50) this.inputHistory.pop();
+                }
+                this.historyIndex = -1;
                 this.inputEl.value = '';
                 this.hideSuggest();
                 return;
             }
+            // 记录历史
+            if (this.inputHistory[0] !== query) {
+                this.inputHistory.unshift(query);
+                if (this.inputHistory.length > 50) this.inputHistory.pop();
+            }
+            this.historyIndex = -1;
             this.inputEl.value = '';
             this.appendMessage('user', (this.chatMode === "wiki_only" ? "🏠 [WIKI] " : "") + query);
             
@@ -112,21 +146,36 @@ class WikicodianView extends obsidian.ItemView {
                                 if (dataStr === '[DONE]') continue;
                                 try {
                                     const json = JSON.parse(dataStr);
+                                    if (json.error) {
+                                        this.appendMessage('bot', `### ❌ 执行错误\n${json.error}`);
+                                        return;
+                                    }
                                     if (!hasStarted) {
                                         hasStarted = true;
                                         window.clearInterval(timer);
                                         statusEl.remove();
-                                        botMsgEl = this.appendMessage('bot', '...');
+                                        botMsgEl = this.appendMessage('bot', '');
+                                    }
+                                    if (json.status) {
+                                        botMsgEl.empty();
+                                        obsidian.MarkdownRenderer.renderMarkdown(json.status, botMsgEl, '', this);
                                     }
                                     if (json.output) {
                                         fullContent += json.output;
                                         botMsgEl.empty();
                                         obsidian.MarkdownRenderer.renderMarkdown(fullContent, botMsgEl, '', this);
                                     }
-                                } catch(e) {}
+                                } catch(e) {
+                                    console.error("JSON parse error", e, dataStr);
+                                }
                             }
                         }
                     }
+                }
+                // 流式结束后，记录完整的 bot 回答
+                if (fullContent) {
+                    this.messages.push({ q: query, a: fullContent });
+                    if (this.messages.length > 20) this.messages.shift();
                 }
             } catch (e) {
                 window.clearInterval(timer);
@@ -163,9 +212,24 @@ class WikicodianView extends obsidian.ItemView {
                         this.hideSuggest();
                     } else handleSend();
                 }
-            } else if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleSend();
+            } else {
+                // 处理提问历史记录导航 (建议列表未唤起时)
+                if (e.key === 'ArrowUp') {
+                    if (this.inputHistory.length > 0) {
+                        e.preventDefault();
+                        this.historyIndex = Math.min(this.historyIndex + 1, this.inputHistory.length - 1);
+                        this.inputEl.value = this.inputHistory[this.historyIndex];
+                    }
+                } else if (e.key === 'ArrowDown') {
+                    if (this.inputHistory.length > 0) {
+                        e.preventDefault();
+                        this.historyIndex = Math.max(this.historyIndex - 1, -1);
+                        this.inputEl.value = this.historyIndex === -1 ? "" : this.inputHistory[this.historyIndex];
+                    }
+                } else if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSend();
+                }
             }
         });
     }
@@ -204,6 +268,32 @@ class WikicodianView extends obsidian.ItemView {
             this.appendMessage('bot', "### 🔄 对话已重置");
             return;
         }
+        if (cmd === "/sync") {
+            const statusEl = this.appendMessage('bot', "⏳ 正在同步 Wiki 索引...");
+            try {
+                const res = await obsidian.requestUrl({
+                    url: `${this.settings.serverUrl}/v1/sync`,
+                    method: 'POST'
+                });
+                statusEl.remove();
+                if (res.status === 200) {
+                    const r = res.json.results;
+                    this.appendMessage('bot', `### ✅ 同步完成\n- 修改文件: ${r.files}\n- 生成分片: ${r.chunks}\n- Wiki页面: ${r.wiki_pages}`);
+                }
+            } catch (e) {
+                statusEl.remove();
+                this.appendMessage('bot', "### ❌ 同步失败");
+            }
+            return;
+        }
+        if (cmd === "/memdraft") {
+            this.handleMemDraft();
+            return;
+        }
+        if (cmd === "/memsave") {
+            this.handleMemSave();
+            return;
+        }
         this.appendMessage('user', cmd);
         try {
             const res = await obsidian.requestUrl({
@@ -230,6 +320,63 @@ class WikicodianView extends obsidian.ItemView {
         }
     }
 
+    async handleMemDraft() {
+        if (this.messages.length === 0) {
+            new obsidian.Notice("当前暂无可整理的对话内容");
+            return;
+        }
+        const statusEl = this.appendMessage('bot', "⏳ 正在整理对话并生成 Wiki 草稿...");
+        try {
+            const res = await obsidian.requestUrl({
+                url: `${this.settings.serverUrl}/v1/memdraft`,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    history: this.messages.slice(-10).map(m => ({ q: m.q, a: m.a })) 
+                })
+            });
+            statusEl.remove();
+            if (res.status === 200 && res.json.status === "success") {
+                const draft = res.json.draft;
+                const title = res.json.title;
+                this.currentDraft = { title, content: draft };
+                this.appendMessage('bot', `### ✅ 已生成 Wiki 草稿：${title}\n\n${draft}\n\n> [!TIP]\n> 点击上方 **[入库]** 按钮即可保存到本地知识库。`);
+            } else {
+                this.appendMessage('bot', `### ❌ 整理失败\n${res.json.message || "请求异常"}`);
+            }
+        } catch (e) {
+            statusEl.remove();
+            this.appendMessage('bot', "### ❌ 连接后端失败");
+        }
+    }
+
+    async handleMemSave() {
+        if (!this.currentDraft.content) {
+            new obsidian.Notice("请先点击 [整理记录] 生成草稿");
+            return;
+        }
+        try {
+            const res = await obsidian.requestUrl({
+                url: `${this.settings.serverUrl}/v1/memsave`,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    title: this.currentDraft.title, 
+                    content: this.currentDraft.content 
+                })
+            });
+            if (res.status === 200 && res.json.status === "success") {
+                new obsidian.Notice(`✅ 入库成功: ${res.json.path}`);
+                this.appendMessage('bot', `### ✨ 已入库\n文件路径: \`${res.json.path}\`\n请执行 \`/sync\` 将其纳入检索。`);
+                this.currentDraft = { title: "", content: "" }; // 清空已保存的草稿
+            } else {
+                this.appendMessage('bot', `### ❌ 保存失败\n${res.json.message || "请求异常"}`);
+            }
+        } catch (e) {
+            this.appendMessage('bot', "### ❌ 连接后端失败");
+        }
+    }
+
     async openExternalOrLocalFile(absPath) {
         const adapter = this.app.vault.adapter;
         const vaultPath = (adapter.basePath || "").replace(/\\/g, '/');
@@ -249,8 +396,11 @@ class WikicodianView extends obsidian.ItemView {
     appendMessage(role, text) {
         const cleanText = text.split('\n').filter(l => !l.startsWith("FILE_PATH:")).join('\n');
         const msgEl = this.messageContainer.createEl('div', { cls: `wikicodian-message wikicodian-message-${role}` });
-        if (role === 'user') msgEl.setText(cleanText);
-        else obsidian.MarkdownRenderer.renderMarkdown(cleanText, msgEl, '', this);
+        if (role === 'user') {
+            msgEl.setText(cleanText);
+        } else {
+            obsidian.MarkdownRenderer.renderMarkdown(cleanText, msgEl, '', this);
+        }
         this.messageContainer.scrollTo(0, this.messageContainer.scrollHeight);
         return msgEl;
     }

@@ -120,3 +120,13 @@
   font-size: 11px;
   color: var(--text-muted);
 }
+
+.wikicodian-mode-toggle {
+  font-weight: bold;
+  transition: all 0.2s ease;
+}
+
+.wikicodian-mode-toggle.is-build {
+  background-color: #ff5722 !important;
+  color: white !important;
+}
