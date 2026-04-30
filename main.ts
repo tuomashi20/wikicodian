@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, Setting, ItemView, MarkdownRenderer, requestUrl, WorkspaceLeaf, TFile, Notice } from 'obsidian';
+import { Plugin, PluginSettingTab, Setting, ItemView, MarkdownRenderer, requestUrl, WorkspaceLeaf, TFile, Notice, FileSystemAdapter } from 'obsidian';
 
 // --- 常量声明 ---
 const VIEW_TYPE_WIKICODIAN = "wikicodian-chat-view";
@@ -27,7 +27,8 @@ const SLASH_COMMANDS = [
     { name: "/structure", desc: "查看当前索引文件结构" },
     { name: "/status", desc: "监控运行状态与模型配置" },
     { name: "/model", desc: "切换 LLM 文本模型" },
-    { name: "/mode", desc: "切换检索模式 (auto/wiki/...)" },
+    { name: "/mode auto", desc: "切换到智能问答模式" },
+    { name: "/mode build", desc: "切换到全自动智能构建模式 (支持执行)" },
     { name: "/ask", desc: "强制 Wiki 增强检索提问" },
     { name: "/resume", desc: "恢复上一次的历史对话" },
     { name: "/reset", desc: "彻底清空当前屏幕与记忆" },
@@ -40,10 +41,16 @@ class WikicodianView extends ItemView {
     messages: any[] = [];
     suggestIndex: number = -1;
     filteredCommands: any[] = [];
-    chatMode: string = "auto";
+    chatMode: string = "plan";
     messageContainer: HTMLElement;
     inputEl: HTMLTextAreaElement;
     suggestContainer: HTMLElement;
+    taskContainer: HTMLElement;
+    fileTagEl: HTMLElement;
+    currentActiveFile: TFile | null = null;
+    updateActiveFileUI: () => void;
+    allSeenTasks: string[] = [];
+    completedTasks: Set<string> = new Set();
 
     constructor(leaf: WorkspaceLeaf, settings: WikicodianSettings) {
         super(leaf);
@@ -68,6 +75,10 @@ class WikicodianView extends ItemView {
         const syncBtn = statusBar.createEl('button', { text: 'Sync Wiki', cls: 'mod-cta' });
         syncBtn.onclick = () => this.executeSlashCommand("/sync");
 
+        // 固定的任务清单区域
+        this.taskContainer = container.createEl('div', { cls: 'wikicodian-task-panel' });
+        (this.taskContainer as any).style.display = 'none';
+
         // 消息区域
         this.messageContainer = container.createEl('div', { cls: 'wikicodian-chat-messages' });
 
@@ -75,16 +86,83 @@ class WikicodianView extends ItemView {
         this.suggestContainer = container.createEl('div', { cls: 'wikicodian-suggest-container' });
         (this.suggestContainer as any).style.display = 'none';
 
-        // 输入区域
-        const inputArea = container.createEl('div', { cls: 'wikicodian-chat-input-area' });
-        this.inputEl = inputArea.createEl('textarea', { 
+        // 输入区域外部包装器 (仿 Claudian)
+        const inputWrapper = container.createEl('div', { cls: 'wikicodian-input-wrapper' });
+
+        this.inputEl = inputWrapper.createEl('textarea', { 
             cls: 'wikicodian-chat-input',
-            attr: { placeholder: '输入 / 唤起全量 WikiCoder 命令...' }
+            attr: { placeholder: 'What\'s new, 老板?' }
         }) as HTMLTextAreaElement;
-        const sendBtn = inputArea.createEl('button', { text: 'Send', cls: 'mod-cta' });
+
+        // 底部控制栏
+        const controlBar = inputWrapper.createEl('div', { cls: 'wikicodian-control-bar' });
+
+        // 左侧控制区 (下拉模式菜单 + 文件标签)
+        const controlLeft = controlBar.createEl('div', { cls: 'wikicodian-control-left' });
+
+        // 模式选择下拉菜单
+        const modeSelect = controlLeft.createEl('select', { cls: 'wikicodian-mode-select' });
+        const modes = [
+            { id: 'plan', label: '📝 Plan' },
+            { id: 'build', label: '🚀 Build' }
+        ];
+        modes.forEach(m => {
+            const opt = modeSelect.createEl('option', { value: m.id, text: m.label });
+            if (this.chatMode === m.id) opt.selected = true;
+        });
+        modeSelect.onchange = (e) => {
+            this.chatMode = (e.target as HTMLSelectElement).value;
+        };
+
+        // 附件文件标签
+        this.fileTagEl = controlLeft.createEl('div', { cls: 'wikicodian-file-tag' });
+        this.updateActiveFileUI = () => {
+            const activeFile = this.app.workspace.getActiveFile();
+            if (activeFile) {
+                this.currentActiveFile = activeFile;
+                this.fileTagEl.empty();
+                this.fileTagEl.createEl('span', { text: '📄', cls: 'wikicodian-file-icon' });
+                this.fileTagEl.createEl('span', { text: activeFile.basename + '.' + activeFile.extension });
+                
+                const closeBtn = this.fileTagEl.createEl('span', { text: '✕', cls: 'wikicodian-file-close' });
+                closeBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    this.currentActiveFile = null;
+                    this.fileTagEl.style.display = 'none';
+                };
+                
+                this.fileTagEl.style.display = 'flex';
+            } else {
+                this.currentActiveFile = null;
+                this.fileTagEl.style.display = 'none';
+            }
+        };
+        this.updateActiveFileUI();
+        this.registerEvent(this.app.workspace.on('file-open', this.updateActiveFileUI));
+
+        // 右侧控制区
+        const controlRight = controlBar.createEl('div', { cls: 'wikicodian-control-right' });
+        const interruptBtn = controlRight.createEl('button', { text: '⏹ 中断', cls: 'wikicodian-yolo-btn' });
+        interruptBtn.style.display = 'none';
+        
+        let currentAbortController: AbortController | null = null;
+        
+        interruptBtn.onclick = () => {
+            if (currentAbortController) {
+                currentAbortController.abort();
+                currentAbortController = null;
+            }
+        };
+
+        const getActiveFileContext = (): string => {
+            if (this.currentActiveFile && this.app.vault.adapter instanceof FileSystemAdapter) {
+                return this.app.vault.adapter.getFullPath(this.currentActiveFile.path);
+            }
+            return "";
+        };
 
         const handleSend = async () => {
-            const query = this.inputEl.value.trim();
+            let query = this.inputEl.value.trim();
             if (!query) return;
 
             if (query.startsWith("/")) {
@@ -95,7 +173,17 @@ class WikicodianView extends ItemView {
             }
 
             this.inputEl.value = '';
-            this.appendMessage('user', (this.chatMode === "wiki_only" ? "🏠 [WIKI] " : "") + query);
+            
+            const attachedPath = getActiveFileContext();
+            let displayQuery = query;
+            let backendQuery = query;
+            
+            if (attachedPath) {
+                displayQuery = `📎 **附件**: \`${this.currentActiveFile?.basename}.${this.currentActiveFile?.extension}\`\n${query}`;
+                backendQuery = `[附言：当前我在屏幕上正在浏览和编辑该文件：${attachedPath}，请以此作为上下文参考]\n\n${query}`;
+            }
+
+            this.appendMessage('user', displayQuery);
             
             const statusEl = this.messageContainer.createEl('div', { cls: 'wikicodian-message wikicodian-status-msg' });
             let seconds = 0;
@@ -105,11 +193,15 @@ class WikicodianView extends ItemView {
                 statusEl.setText(`工作中......(${seconds}s)`);
             }, 1000);
 
+            interruptBtn.style.display = 'block';
+            currentAbortController = new AbortController();
+
             try {
                 const response = await fetch(`${this.settings.serverUrl}/v1/chat`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query, mode: this.chatMode, history: this.messages.slice(-5) })
+                    body: JSON.stringify({ query: backendQuery, mode: this.chatMode, history: this.messages.slice(-5) }),
+                    signal: currentAbortController.signal
                 });
 
                 const reader = response.body?.getReader();
@@ -136,24 +228,54 @@ class WikicodianView extends ItemView {
                                         statusEl.remove();
                                         botMsgEl = this.appendMessage('bot', '...');
                                     }
+                                    
+                                    if (json.tasks && Array.isArray(json.tasks)) {
+                                        this.updateTasks(json.tasks);
+                                    }
+                                    
+                                    if (json.status) {
+                                        botMsgEl!.empty();
+                                        MarkdownRenderer.renderMarkdown(json.status, botMsgEl!, '', this as any);
+                                        if (json.require_confirm && json.confirm_id) {
+                                            const cBox = botMsgEl!.createEl('div', { cls: 'wikicodian-confirm-box' });
+                                            cBox.createEl('strong', { text: `⚠️ 高危操作拦截: ${json.action_type}` });
+                                            const btnGroup = cBox.createEl('div');
+                                            const btnY = btnGroup.createEl('button', { text: '允许执行', cls: 'mod-cta' });
+                                            const btnN = btnGroup.createEl('button', { text: '拒绝', cls: 'mod-warning' });
+                                            btnY.onclick = () => this.sendConfirm(json.confirm_id, true, cBox);
+                                            btnN.onclick = () => this.sendConfirm(json.confirm_id, false, cBox);
+                                        }
+                                        this.messageContainer.scrollTo(0, this.messageContainer.scrollHeight);
+                                    }
+                                    
                                     if (json.output) {
+                                        if (json.thought === '任务完成') {
+                                            this.allSeenTasks.forEach(t => this.completedTasks.add(t));
+                                            this.renderTasks();
+                                        }
                                         fullContent += json.output;
                                         botMsgEl!.empty();
                                         MarkdownRenderer.renderMarkdown(fullContent, botMsgEl!, '', this as any);
+                                        this.messageContainer.scrollTo(0, this.messageContainer.scrollHeight);
                                     }
                                 } catch(e) {}
                             }
                         }
                     }
                 }
-            } catch (e) {
+            } catch (e: any) {
                 window.clearInterval(timer);
-                statusEl.remove();
-                this.appendMessage('bot', `### ❌ 连接错误\n请检查后端 \`serve\` 服务。`);
+                if (statusEl && statusEl.parentElement) statusEl.remove();
+                if (e.name === 'AbortError') {
+                    this.appendMessage('bot', `⚠️ **操作已由用户手动中断。**`);
+                } else {
+                    this.appendMessage('bot', `### ❌ 连接错误\n请检查后端 \`serve\` 服务。`);
+                }
+            } finally {
+                interruptBtn.style.display = 'none';
+                currentAbortController = null;
             }
         };
-
-        sendBtn.onclick = handleSend;
 
         this.inputEl.addEventListener('input', () => {
             const val = this.inputEl.value;
@@ -189,6 +311,68 @@ class WikicodianView extends ItemView {
                 handleSend();
             }
         });
+    }
+
+    async sendConfirm(confirmId: string, approved: boolean, boxEl: HTMLElement) {
+        boxEl.empty();
+        boxEl.createEl('span', { text: approved ? "✅ 已授权执行，等待结果..." : "❌ 已拒绝执行" });
+        try {
+            await fetch(`${this.settings.serverUrl}/v1/confirm`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ confirm_id: confirmId, approved })
+            });
+        } catch (e) {}
+    }
+
+    updateTasks(tasks: string[]) {
+        let activeThisRound: string[] = [];
+        for (let t of tasks) {
+            let isDone = false;
+            let cleanT = t;
+            if (t.toLowerCase().startsWith("[x]") || t.startsWith("✅")) {
+                cleanT = t.toLowerCase().startsWith("[x]") ? t.substring(3).trim() : t.substring(1).trim();
+                isDone = true;
+            }
+            
+            // 正则去重: 剥离 "1. " 或 "- " 等前缀
+            cleanT = cleanT.replace(/^(\d+[\.\-、]\s*|\-\s*)/, '').trim();
+            
+            if (!this.allSeenTasks.includes(cleanT)) this.allSeenTasks.push(cleanT);
+            
+            if (isDone) this.completedTasks.add(cleanT);
+            else activeThisRound.push(cleanT);
+        }
+        
+        for (let t of this.allSeenTasks) {
+            if (!activeThisRound.includes(t) && !this.completedTasks.has(t)) {
+                this.completedTasks.add(t);
+            }
+        }
+        this.renderTasks();
+    }
+
+    renderTasks() {
+        if (this.allSeenTasks.length === 0) {
+            (this.taskContainer as any).style.display = 'none';
+            return;
+        }
+        (this.taskContainer as any).style.display = 'block';
+        this.taskContainer.empty();
+        const header = this.taskContainer.createEl('div', { cls: 'wikicodian-task-header' });
+        header.createEl('strong', { text: '>> 任务清单' });
+        
+        const list = this.taskContainer.createEl('div', { cls: 'wikicodian-task-list' });
+        for (let t of this.allSeenTasks) {
+            const row = list.createEl('div', { cls: 'wikicodian-task-row' });
+            if (this.completedTasks.has(t)) {
+                row.createEl('span', { text: '✅', cls: 'wikicodian-task-icon-done' });
+                row.createEl('span', { text: t, cls: 'wikicodian-task-text-done' });
+            } else {
+                row.createEl('span', { text: '⏳', cls: 'wikicodian-task-icon-active' });
+                row.createEl('span', { text: t, cls: 'wikicodian-task-text-active' });
+            }
+        }
     }
 
     showSuggest(val: string) {
@@ -227,13 +411,32 @@ class WikicodianView extends ItemView {
             this.appendMessage('bot', "### 🔄 对话已重置");
             return;
         }
+        if (cmd.startsWith("/mode ")) {
+            const newMode = cmd.split(" ")[1];
+            if (["auto", "plan", "wiki_only", "general_only", "build"].includes(newMode)) {
+                this.chatMode = newMode;
+                // 更新下拉菜单
+                const sel = this.containerEl.querySelector('.wikicodian-mode-select') as HTMLSelectElement;
+                if(sel) sel.value = newMode;
+                
+                this.appendMessage('bot', `✅ 已在前端切换模式: \`${newMode}\``);
+                return;
+            }
+        }
+        
+        let backendCmd = cmd;
+        if (this.currentActiveFile && this.app.vault.adapter instanceof FileSystemAdapter) {
+            const p = this.app.vault.adapter.getFullPath(this.currentActiveFile.path);
+            backendCmd += ` --file "${p}"`;
+        }
+
         this.appendMessage('user', cmd);
         try {
             const res = await requestUrl({
                 url: `${this.settings.serverUrl}/v1/exec`,
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ command: cmd })
+                body: JSON.stringify({ command: backendCmd })
             });
             if (res.status === 200) {
                 const output = res.json.output || "执行成功";
