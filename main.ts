@@ -44,6 +44,8 @@ class WikicodianView extends ItemView {
     chatMode: string = "plan";
     messageContainer: HTMLElement;
     inputEl: HTMLTextAreaElement;
+    inputHistory: string[] = [];
+    historyIndex: number = -1;
     suggestContainer: HTMLElement;
     taskContainer: HTMLElement;
     fileTagEl: HTMLElement;
@@ -165,13 +167,19 @@ class WikicodianView extends ItemView {
             let query = this.inputEl.value.trim();
             if (!query) return;
 
+            // 记录到输入历史
+            if (!this.inputHistory.length || this.inputHistory[this.inputHistory.length - 1] !== query) {
+                this.inputHistory.push(query);
+            }
+            this.historyIndex = -1;
+
             if (query.startsWith("/")) {
                 this.executeSlashCommand(query);
                 this.inputEl.value = '';
                 this.hideSuggest();
                 return;
             }
-
+            // ... (剩余 handleSend 逻辑保持不变)
             this.inputEl.value = '';
             
             const attachedPath = getActiveFileContext();
@@ -184,6 +192,9 @@ class WikicodianView extends ItemView {
             }
 
             this.appendMessage('user', displayQuery);
+            // 记录到历史记录中 (初始 a 为空)
+            this.messages.push({ q: backendQuery, a: "" });
+            const currentMsgIndex = this.messages.length - 1;
             
             const statusEl = this.messageContainer.createEl('div', { cls: 'wikicodian-message wikicodian-status-msg' });
             let seconds = 0;
@@ -197,10 +208,16 @@ class WikicodianView extends ItemView {
             currentAbortController = new AbortController();
 
             try {
+                const vaultPath = (this.app.vault.adapter as any).basePath || "";
                 const response = await fetch(`${this.settings.serverUrl}/v1/chat`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query: backendQuery, mode: this.chatMode, history: this.messages.slice(-5) }),
+                    body: JSON.stringify({ 
+                        query: backendQuery, 
+                        mode: this.chatMode, 
+                        history: this.messages.slice(-5),
+                        cwd: vaultPath
+                    }),
                     signal: currentAbortController.signal
                 });
 
@@ -254,6 +271,9 @@ class WikicodianView extends ItemView {
                                             this.renderTasks();
                                         }
                                         fullContent += json.output;
+                                        // 同步更新历史记录中的回答
+                                        this.messages[currentMsgIndex].a = fullContent;
+                                        
                                         botMsgEl!.empty();
                                         MarkdownRenderer.renderMarkdown(fullContent, botMsgEl!, '', this as any);
                                         this.messageContainer.scrollTo(0, this.messageContainer.scrollHeight);
@@ -306,9 +326,29 @@ class WikicodianView extends ItemView {
                         this.hideSuggest();
                     } else handleSend();
                 }
-            } else if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleSend();
+            } else {
+                if (e.key === 'ArrowUp') {
+                    if (this.inputHistory.length > 0) {
+                        e.preventDefault();
+                        if (this.historyIndex === -1) this.historyIndex = this.inputHistory.length - 1;
+                        else if (this.historyIndex > 0) this.historyIndex--;
+                        this.inputEl.value = this.inputHistory[this.historyIndex];
+                    }
+                } else if (e.key === 'ArrowDown') {
+                    if (this.inputHistory.length > 0 && this.historyIndex !== -1) {
+                        e.preventDefault();
+                        if (this.historyIndex < this.inputHistory.length - 1) {
+                            this.historyIndex++;
+                            this.inputEl.value = this.inputHistory[this.historyIndex];
+                        } else {
+                            this.historyIndex = -1;
+                            this.inputEl.value = "";
+                        }
+                    }
+                } else if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSend();
+                }
             }
         });
     }
@@ -441,6 +481,7 @@ class WikicodianView extends ItemView {
             if (res.status === 200) {
                 const output = res.json.output || "执行成功";
                 this.appendMessage('bot', output);
+                this.messages.push({ q: backendCmd, a: output });
 
                 // --- 自动打开生成的文件 ---
                 if (output.includes("FILE_PATH:")) {

@@ -12,7 +12,8 @@
     "isolatedModules": true,
     "strict": false,
     "lib": ["DOM", "ESNext"],
-    "types": ["node"]
+    "types": ["node"],
+    "skipLibCheck": true
   },
   "include": ["**/*.ts"]
 }
