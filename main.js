@@ -39,35 +39,20 @@ __export(main_exports, {
 var import_obsidian = require("obsidian");
 var VIEW_TYPE_WIKICODIAN = "wikicodian-chat-view";
 var DEFAULT_SETTINGS = {
-  serverUrl: "http://127.0.0.1:8000"
+  serverUrl: "http://127.0.0.1:8000",
+  agentSearchLimit: 8,
+  boostTerms: "\u7ED3\u7B97, \u6807\u51C6, \u7EAA\u8981, 2024, 66\u53F7",
+  wikiEnabled: false,
+  reportTemplate: "business_audit.md"
 };
 var SLASH_COMMANDS = [
-  { name: "/sync", desc: "\u540C\u6B65\u7B14\u8BB0\u5230 AI \u7D22\u5F15" },
-  { name: "/md2canvas", desc: "\u5C06\u5F53\u524D\u6587\u4EF6\u8F6C\u4E3A Canvas (3\u5C42\u6B63\u5219\u7248)" },
-  { name: "/md2canvas_ai", desc: "\u5C06\u5F53\u524D\u6587\u4EF6\u8F6C\u4E3A Canvas (AI \u6DF1\u5EA6\u7248)" },
-  { name: "/pdf2md", desc: "PDF \u667A\u80FD\u8F6C Markdown (\u52A0\u8DEF\u5F84)" },
-  { name: "/docx2md", desc: "Word \u8F6C Markdown (\u52A0\u8DEF\u5F84)" },
-  { name: "/xlsx2md", desc: "Excel \u8F6C Markdown (\u52A0\u8DEF\u5F84)" },
-  { name: "/kbclear all yes", desc: "\u7269\u7406\u6E05\u7A7A\u7D22\u5F15 + Wiki \u9875\u9762" },
-  { name: "/kbclear yes", desc: "\u4EC5\u6E05\u7A7A\u672C\u5730\u7D22\u5F15\u788E\u7247" },
-  { name: "/kbsave", desc: "\u521B\u5EFA\u77E5\u8BC6\u5E93\u5FEB\u7167\u5907\u4EFD" },
-  { name: "/kbbackups", desc: "\u67E5\u770B\u5386\u53F2\u5FEB\u7167\u5217\u8868" },
-  { name: "/kbrestore", desc: "\u6062\u590D\u6307\u5B9A\u5FEB\u7167 (\u52A0 ID)" },
-  { name: "/vaultpath", desc: "\u67E5\u770B/\u8BBE\u7F6E\u5E93\u8DEF\u5F84 (\u52A0\u8DEF\u5F84)" },
-  { name: "/structure", desc: "\u67E5\u770B\u5F53\u524D\u7D22\u5F15\u6587\u4EF6\u7ED3\u6784" },
-  { name: "/status", desc: "\u76D1\u63A7\u8FD0\u884C\u72B6\u6001\u4E0E\u6A21\u578B\u914D\u7F6E" },
-  { name: "/model", desc: "\u5207\u6362 LLM \u6587\u672C\u6A21\u578B" },
-  { name: "/mode auto", desc: "\u5207\u6362\u5230\u667A\u80FD\u95EE\u7B54\u6A21\u5F0F" },
-  { name: "/mode build", desc: "\u5207\u6362\u5230\u5168\u81EA\u52A8\u667A\u80FD\u6784\u5EFA\u6A21\u5F0F (\u652F\u6301\u6267\u884C)" },
-  { name: "/ask", desc: "\u5F3A\u5236 Wiki \u589E\u5F3A\u68C0\u7D22\u63D0\u95EE" },
-  { name: "/resume", desc: "\u6062\u590D\u4E0A\u4E00\u6B21\u7684\u5386\u53F2\u5BF9\u8BDD" },
-  { name: "/reset", desc: "\u5F7B\u5E95\u6E05\u7A7A\u5F53\u524D\u5C4F\u5E55\u4E0E\u8BB0\u5FC6" },
-  { name: "/help", desc: "\u663E\u793A\u5168\u91CF\u547D\u4EE4\u4F7F\u7528\u624B\u518C" }
+  { name: "/help", desc: "\u{1F4E1} \u6B63\u5728\u4ECE\u540E\u7AEF\u540C\u6B65\u6307\u4EE4\u96C6..." }
 ];
 var WikicodianView = class extends import_obsidian.ItemView {
-  constructor(leaf, settings) {
+  constructor(leaf, plugin) {
     super(leaf);
     __publicField(this, "settings");
+    __publicField(this, "plugin");
     __publicField(this, "messages", []);
     __publicField(this, "suggestIndex", -1);
     __publicField(this, "filteredCommands", []);
@@ -79,11 +64,14 @@ var WikicodianView = class extends import_obsidian.ItemView {
     __publicField(this, "suggestContainer");
     __publicField(this, "taskContainer");
     __publicField(this, "fileTagEl");
+    __publicField(this, "wikiStatusEl");
     __publicField(this, "currentActiveFile", null);
     __publicField(this, "updateActiveFileUI");
     __publicField(this, "allSeenTasks", []);
     __publicField(this, "completedTasks", /* @__PURE__ */ new Set());
-    this.settings = settings;
+    __publicField(this, "modeSelect");
+    this.plugin = plugin;
+    this.settings = plugin.settings;
   }
   getViewType() {
     return VIEW_TYPE_WIKICODIAN;
@@ -98,15 +86,23 @@ var WikicodianView = class extends import_obsidian.ItemView {
     const container = this.containerEl.children[1];
     container.empty();
     container.addClass("wikicodian-chat-container");
+    try {
+      const cmdRes = await (0, import_obsidian.requestUrl)({ url: `${this.settings.serverUrl}/v1/commands` });
+      if (cmdRes.json && Array.isArray(cmdRes.json)) {
+        SLASH_COMMANDS = cmdRes.json;
+      }
+    } catch (e) {
+      console.error("Failed to load commands from backend:", e);
+    }
     const statusBar = container.createEl("div", { cls: "wikicodian-sync-bar" });
     const statusInfo = statusBar.createEl("div");
     statusInfo.createEl("span", { cls: "wikicodian-status-dot wikicodian-status-online" });
-    statusInfo.createSpan({ text: "WikiCoder Backend Online" });
-    const syncBtn = statusBar.createEl("button", { text: "Sync Wiki", cls: "mod-cta" });
+    statusInfo.createSpan({ text: "WikiCoder Online" });
+    const syncBtn = statusBar.createEl("button", { text: "\u540C\u6B65\u4E13\u5BB6\u56FE\u8C31", cls: "mod-cta" });
     syncBtn.onclick = () => this.executeSlashCommand("/sync");
     this.taskContainer = container.createEl("div", { cls: "wikicodian-task-panel" });
     this.taskContainer.style.display = "none";
-    this.messageContainer = container.createEl("div", { cls: "wikicodian-chat-messages" });
+    this.messageContainer = container.createEl("div", { cls: "wikicodian-chat-messages markdown-preview-view" });
     this.suggestContainer = container.createEl("div", { cls: "wikicodian-suggest-container" });
     this.suggestContainer.style.display = "none";
     const inputWrapper = container.createEl("div", { cls: "wikicodian-input-wrapper" });
@@ -116,18 +112,23 @@ var WikicodianView = class extends import_obsidian.ItemView {
     });
     const controlBar = inputWrapper.createEl("div", { cls: "wikicodian-control-bar" });
     const controlLeft = controlBar.createEl("div", { cls: "wikicodian-control-left" });
-    const modeSelect = controlLeft.createEl("select", { cls: "wikicodian-mode-select" });
-    const modes = [
-      { id: "plan", label: "\u{1F4DD} Plan" },
-      { id: "build", label: "\u{1F680} Build" }
-    ];
+    this.modeSelect = controlLeft.createEl("select", { cls: "wikicodian-mode-select" });
+    const modes = [{ id: "plan", label: "\u{1F4DD} Plan" }, { id: "build", label: "\u{1F680} Build" }];
     modes.forEach((m) => {
-      const opt = modeSelect.createEl("option", { value: m.id, text: m.label });
+      const opt = this.modeSelect.createEl("option", { value: m.id, text: m.label });
       if (this.chatMode === m.id)
         opt.selected = true;
     });
-    modeSelect.onchange = (e) => {
+    this.modeSelect.onchange = (e) => {
       this.chatMode = e.target.value;
+    };
+    this.wikiStatusEl = controlLeft.createEl("div", { cls: "wikicodian-wiki-status" });
+    this.updateWikiUI();
+    this.wikiStatusEl.onclick = async () => {
+      this.settings.wikiEnabled = !this.settings.wikiEnabled;
+      await this.plugin.saveSettings();
+      this.updateWikiUI();
+      new import_obsidian.Notice(this.settings.wikiEnabled ? "\u{1F4DA} \u5168\u5C40 Wiki \u589E\u5F3A\u5DF2\u5F00\u542F" : "\u{1F4DA} \u5168\u5C40 Wiki \u589E\u5F3A\u5DF2\u5173\u95ED");
     };
     this.fileTagEl = controlLeft.createEl("div", { cls: "wikicodian-file-tag" });
     this.updateActiveFileUI = () => {
@@ -136,7 +137,7 @@ var WikicodianView = class extends import_obsidian.ItemView {
         this.currentActiveFile = activeFile;
         this.fileTagEl.empty();
         this.fileTagEl.createEl("span", { text: "\u{1F4C4}", cls: "wikicodian-file-icon" });
-        this.fileTagEl.createEl("span", { text: activeFile.basename + "." + activeFile.extension });
+        this.fileTagEl.createEl("span", { text: activeFile.basename });
         const closeBtn = this.fileTagEl.createEl("span", { text: "\u2715", cls: "wikicodian-file-close" });
         closeBtn.onclick = (e) => {
           e.stopPropagation();
@@ -159,50 +160,42 @@ var WikicodianView = class extends import_obsidian.ItemView {
       if (currentAbortController) {
         currentAbortController.abort();
         currentAbortController = null;
+        new import_obsidian.Notice("\u23F9 \u4EFB\u52A1\u5DF2\u5F3A\u884C\u4E2D\u6B62 (\u534F\u4F5C\u5F0F)");
       }
-    };
-    const getActiveFileContext = () => {
-      if (this.currentActiveFile && this.app.vault.adapter instanceof import_obsidian.FileSystemAdapter) {
-        return this.app.vault.adapter.getFullPath(this.currentActiveFile.path);
-      }
-      return "";
     };
     const handleSend = async () => {
-      var _a, _b, _c;
+      var _a, _b;
       let query = this.inputEl.value.trim();
       if (!query)
         return;
-      if (!this.inputHistory.length || this.inputHistory[this.inputHistory.length - 1] !== query) {
-        this.inputHistory.push(query);
+      if (this.settings.wikiEnabled && !query.toLowerCase().includes("@wikiagent")) {
+        query = `@wikiagent ${query}`;
       }
-      this.historyIndex = -1;
       if (query.startsWith("/")) {
         this.executeSlashCommand(query);
         this.inputEl.value = "";
-        this.hideSuggest();
         return;
       }
+      if (!this.inputHistory.includes(query)) {
+        this.inputHistory.push(query);
+      }
+      this.historyIndex = this.inputHistory.length;
       this.inputEl.value = "";
-      const attachedPath = getActiveFileContext();
+      const attachedPath = this.currentActiveFile && this.app.vault.adapter instanceof import_obsidian.FileSystemAdapter ? this.app.vault.adapter.getFullPath(this.currentActiveFile.path) : "";
       let displayQuery = query;
       let backendQuery = query;
       if (attachedPath) {
-        displayQuery = `\u{1F4CE} **\u9644\u4EF6**: \`${(_a = this.currentActiveFile) == null ? void 0 : _a.basename}.${(_b = this.currentActiveFile) == null ? void 0 : _b.extension}\`
+        displayQuery = `\u{1F4CE} **\u9644\u4EF6**: \`${(_a = this.currentActiveFile) == null ? void 0 : _a.basename}\`
 ${query}`;
-        backendQuery = `[\u9644\u8A00\uFF1A\u5F53\u524D\u6211\u5728\u5C4F\u5E55\u4E0A\u6B63\u5728\u6D4F\u89C8\u548C\u7F16\u8F91\u8BE5\u6587\u4EF6\uFF1A${attachedPath}\uFF0C\u8BF7\u4EE5\u6B64\u4F5C\u4E3A\u4E0A\u4E0B\u6587\u53C2\u8003]
+        backendQuery = `[\u9644\u8A00\uFF1A\u5F53\u524D\u6211\u5728\u5C4F\u5E55\u4E0A\u6B63\u5728\u6D4F\u89C8\u548C\u7F16\u8F91\u8BE5\u6587\u4EF6\uFF1A${attachedPath}]
 
 ${query}`;
       }
-      this.appendMessage("user", displayQuery);
+      await this.appendMessage("user", displayQuery);
       this.messages.push({ q: backendQuery, a: "" });
       const currentMsgIndex = this.messages.length - 1;
       const statusEl = this.messageContainer.createEl("div", { cls: "wikicodian-message wikicodian-status-msg" });
-      let seconds = 0;
-      statusEl.setText(`\u5DE5\u4F5C\u4E2D......(0s)`);
-      const timer = window.setInterval(() => {
-        seconds++;
-        statusEl.setText(`\u5DE5\u4F5C\u4E2D......(${seconds}s)`);
-      }, 1e3);
+      statusEl.setText(`\u{1F9E0} \u6B63\u5728\u6DF1\u5EA6\u62C6\u89E3\u6307\u4EE4...`);
       interruptBtn.style.display = "block";
       currentAbortController = new AbortController();
       try {
@@ -214,15 +207,21 @@ ${query}`;
             query: backendQuery,
             mode: this.chatMode,
             history: this.messages.slice(-5),
-            cwd: vaultPath
+            cwd: vaultPath,
+            agent_search_limit: this.settings.agentSearchLimit,
+            rag_filename_boost_terms: this.settings.boostTerms.split(",").map((t) => t.trim()).filter((t) => t),
+            report_template: this.settings.reportTemplate
           }),
           signal: currentAbortController.signal
         });
-        const reader = (_c = response.body) == null ? void 0 : _c.getReader();
+        const reader = (_b = response.body) == null ? void 0 : _b.getReader();
         const decoder = new TextDecoder();
         let hasStarted = false;
         let botMsgEl = null;
+        let botStatusEl = null;
+        let botContentEl = null;
         let fullContent = "";
+        const thoughts = [];
         if (reader) {
           while (true) {
             const { done, value } = await reader.read();
@@ -239,36 +238,38 @@ ${query}`;
                   const json = JSON.parse(dataStr);
                   if (!hasStarted) {
                     hasStarted = true;
-                    window.clearInterval(timer);
                     statusEl.remove();
-                    botMsgEl = this.appendMessage("bot", "...");
-                  }
-                  if (json.tasks && Array.isArray(json.tasks)) {
-                    this.updateTasks(json.tasks);
+                    botMsgEl = await this.appendMessage("bot", "");
+                    botStatusEl = botMsgEl.createEl("div", { cls: "wikicodian-thought-bubble" });
+                    botContentEl = botMsgEl.createEl("div", { cls: "markdown-rendered" });
                   }
                   if (json.status) {
-                    botMsgEl.empty();
-                    import_obsidian.MarkdownRenderer.renderMarkdown(json.status, botMsgEl, "", this);
-                    if (json.require_confirm && json.confirm_id) {
-                      const cBox = botMsgEl.createEl("div", { cls: "wikicodian-confirm-box" });
-                      cBox.createEl("strong", { text: `\u26A0\uFE0F \u9AD8\u5371\u64CD\u4F5C\u62E6\u622A: ${json.action_type}` });
-                      const btnGroup = cBox.createEl("div");
-                      const btnY = btnGroup.createEl("button", { text: "\u5141\u8BB8\u6267\u884C", cls: "mod-cta" });
-                      const btnN = btnGroup.createEl("button", { text: "\u62D2\u7EDD", cls: "mod-warning" });
-                      btnY.onclick = () => this.sendConfirm(json.confirm_id, true, cBox);
-                      btnN.onclick = () => this.sendConfirm(json.confirm_id, false, cBox);
+                    const isTimer = json.status.includes("(\u5DF2\u8017\u65F6");
+                    const lastThought = thoughts.length > 0 ? thoughts[thoughts.length - 1] : null;
+                    const lastIsTimer = lastThought && lastThought.includes("(\u5DF2\u8017\u65F6");
+                    if (isTimer && lastIsTimer) {
+                      thoughts[thoughts.length - 1] = json.status;
+                    } else if (lastThought !== json.status) {
+                      thoughts.push(json.status);
                     }
-                    this.messageContainer.scrollTo(0, this.messageContainer.scrollHeight);
+                    botStatusEl.empty();
+                    thoughts.forEach((t, i) => {
+                      botStatusEl.createEl("div", {
+                        text: `${i + 1}. ${t}`,
+                        cls: "wikicodian-thought-step"
+                      });
+                    });
                   }
                   if (json.output) {
-                    if (json.thought === "\u4EFB\u52A1\u5B8C\u6210") {
-                      this.allSeenTasks.forEach((t) => this.completedTasks.add(t));
-                      this.renderTasks();
+                    if (botStatusEl && botStatusEl.style.display !== "none") {
+                      botStatusEl.style.display = "none";
                     }
                     fullContent += json.output;
                     this.messages[currentMsgIndex].a = fullContent;
-                    botMsgEl.empty();
-                    import_obsidian.MarkdownRenderer.renderMarkdown(fullContent, botMsgEl, "", this);
+                    if (botContentEl) {
+                      botContentEl.empty();
+                      import_obsidian.MarkdownRenderer.renderMarkdown(fullContent, botContentEl, "", this);
+                    }
                     this.messageContainer.scrollTo(0, this.messageContainer.scrollHeight);
                   }
                 } catch (e) {
@@ -278,30 +279,35 @@ ${query}`;
           }
         }
       } catch (e) {
-        window.clearInterval(timer);
-        if (statusEl && statusEl.parentElement)
+        if (statusEl)
           statusEl.remove();
-        if (e.name === "AbortError") {
-          this.appendMessage("bot", `\u26A0\uFE0F **\u64CD\u4F5C\u5DF2\u7531\u7528\u6237\u624B\u52A8\u4E2D\u65AD\u3002**`);
-        } else {
-          this.appendMessage("bot", `### \u274C \u8FDE\u63A5\u9519\u8BEF
-\u8BF7\u68C0\u67E5\u540E\u7AEF \`serve\` \u670D\u52A1\u3002`);
-        }
+        if (e.name === "AbortError")
+          await this.appendMessage("bot", `\u26A0\uFE0F **\u4EFB\u52A1\u5DF2\u5F3A\u5236\u4E2D\u6B62\u3002** \u540E\u7AEF\u5DF2\u5B89\u5168\u56DE\u6536\u8D44\u6E90\u3002`);
+        else
+          await this.appendMessage("bot", `### \u274C \u8FDE\u63A5\u5931\u8D25
+\u8BF7\u68C0\u67E5\u540E\u7AEF \`serve\`\u3002`);
       } finally {
         interruptBtn.style.display = "none";
         currentAbortController = null;
       }
     };
-    this.inputEl.addEventListener("input", () => {
+    this.inputEl.oninput = () => {
       const val = this.inputEl.value;
-      if (val.startsWith("/"))
-        this.showSuggest(val);
-      else
-        this.hideSuggest();
-    });
-    this.inputEl.addEventListener("keydown", (e) => {
-      const isSuggestVisible = this.suggestContainer.style.display !== "none";
-      if (isSuggestVisible) {
+      if (val.startsWith("/")) {
+        const search = val.slice(1).toLowerCase();
+        this.filteredCommands = SLASH_COMMANDS.filter((c) => c.name.toLowerCase().includes(search) || c.desc && c.desc.toLowerCase().includes(search));
+        if (this.filteredCommands.length > 0) {
+          this.suggestIndex = 0;
+          this.renderSuggest();
+        } else {
+          this.suggestContainer.style.display = "none";
+        }
+      } else {
+        this.suggestContainer.style.display = "none";
+      }
+    };
+    this.inputEl.onkeydown = (e) => {
+      if (this.suggestContainer.style.display !== "none" && this.filteredCommands.length > 0) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
           this.suggestIndex = (this.suggestIndex + 1) % this.filteredCommands.length;
@@ -310,206 +316,108 @@ ${query}`;
           e.preventDefault();
           this.suggestIndex = (this.suggestIndex - 1 + this.filteredCommands.length) % this.filteredCommands.length;
           this.renderSuggest();
+        } else if (e.key === "Enter" || e.key === "Tab") {
+          e.preventDefault();
+          const cmd = this.filteredCommands[this.suggestIndex].name;
+          this.inputEl.value = cmd + " ";
+          this.suggestContainer.style.display = "none";
+          this.inputEl.focus();
         } else if (e.key === "Escape") {
-          e.preventDefault();
-          this.hideSuggest();
-        } else if (e.key === "Enter") {
-          e.preventDefault();
-          if (this.suggestIndex >= 0) {
-            this.executeSlashCommand(this.filteredCommands[this.suggestIndex].name);
-            this.inputEl.value = "";
-            this.hideSuggest();
-          } else
-            handleSend();
+          this.suggestContainer.style.display = "none";
         }
       } else {
-        if (e.key === "ArrowUp") {
-          if (this.inputHistory.length > 0) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          handleSend();
+        } else if (e.key === "ArrowUp") {
+          if (this.historyIndex > 0) {
             e.preventDefault();
-            if (this.historyIndex === -1)
-              this.historyIndex = this.inputHistory.length - 1;
-            else if (this.historyIndex > 0)
-              this.historyIndex--;
+            this.historyIndex--;
             this.inputEl.value = this.inputHistory[this.historyIndex];
           }
         } else if (e.key === "ArrowDown") {
-          if (this.inputHistory.length > 0 && this.historyIndex !== -1) {
+          if (this.historyIndex < this.inputHistory.length - 1) {
             e.preventDefault();
-            if (this.historyIndex < this.inputHistory.length - 1) {
-              this.historyIndex++;
-              this.inputEl.value = this.inputHistory[this.historyIndex];
-            } else {
-              this.historyIndex = -1;
-              this.inputEl.value = "";
-            }
+            this.historyIndex++;
+            this.inputEl.value = this.inputHistory[this.historyIndex];
+          } else if (this.historyIndex === this.inputHistory.length - 1) {
+            e.preventDefault();
+            this.historyIndex++;
+            this.inputEl.value = "";
           }
-        } else if (e.key === "Enter" && !e.shiftKey) {
-          e.preventDefault();
-          handleSend();
         }
       }
-    });
-  }
-  async sendConfirm(confirmId, approved, boxEl) {
-    boxEl.empty();
-    boxEl.createEl("span", { text: approved ? "\u2705 \u5DF2\u6388\u6743\u6267\u884C\uFF0C\u7B49\u5F85\u7ED3\u679C..." : "\u274C \u5DF2\u62D2\u7EDD\u6267\u884C" });
-    try {
-      await fetch(`${this.settings.serverUrl}/v1/confirm`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ confirm_id: confirmId, approved })
-      });
-    } catch (e) {
-    }
-  }
-  updateTasks(tasks) {
-    let activeThisRound = [];
-    for (let t of tasks) {
-      let isDone = false;
-      let cleanT = t;
-      if (t.toLowerCase().startsWith("[x]") || t.startsWith("\u2705")) {
-        cleanT = t.toLowerCase().startsWith("[x]") ? t.substring(3).trim() : t.substring(1).trim();
-        isDone = true;
-      }
-      cleanT = cleanT.replace(/^(\d+[\.\-、]\s*|\-\s*)/, "").trim();
-      if (!this.allSeenTasks.includes(cleanT))
-        this.allSeenTasks.push(cleanT);
-      if (isDone)
-        this.completedTasks.add(cleanT);
-      else
-        activeThisRound.push(cleanT);
-    }
-    for (let t of this.allSeenTasks) {
-      if (!activeThisRound.includes(t) && !this.completedTasks.has(t)) {
-        this.completedTasks.add(t);
-      }
-    }
-    this.renderTasks();
-  }
-  renderTasks() {
-    if (this.allSeenTasks.length === 0) {
-      this.taskContainer.style.display = "none";
-      return;
-    }
-    this.taskContainer.style.display = "block";
-    this.taskContainer.empty();
-    const header = this.taskContainer.createEl("div", { cls: "wikicodian-task-header" });
-    header.createEl("strong", { text: ">> \u4EFB\u52A1\u6E05\u5355" });
-    const list = this.taskContainer.createEl("div", { cls: "wikicodian-task-list" });
-    for (let t of this.allSeenTasks) {
-      const row = list.createEl("div", { cls: "wikicodian-task-row" });
-      if (this.completedTasks.has(t)) {
-        row.createEl("span", { text: "\u2705", cls: "wikicodian-task-icon-done" });
-        row.createEl("span", { text: t, cls: "wikicodian-task-text-done" });
-      } else {
-        row.createEl("span", { text: "\u23F3", cls: "wikicodian-task-icon-active" });
-        row.createEl("span", { text: t, cls: "wikicodian-task-text-active" });
-      }
-    }
-  }
-  showSuggest(val) {
-    this.filteredCommands = SLASH_COMMANDS.filter((c) => c.name.startsWith(val.toLowerCase()));
-    if (this.filteredCommands.length > 0) {
-      this.suggestIndex = 0;
-      this.renderSuggest();
-      this.suggestContainer.style.display = "block";
-    } else
-      this.hideSuggest();
-  }
-  hideSuggest() {
-    this.suggestContainer.style.display = "none";
-    this.suggestIndex = -1;
+    };
   }
   renderSuggest() {
     this.suggestContainer.empty();
-    this.filteredCommands.forEach((cmd, idx) => {
+    this.suggestContainer.style.display = "block";
+    this.filteredCommands.forEach((cmd, i) => {
       const item = this.suggestContainer.createEl("div", { cls: "wikicodian-suggest-item" });
-      if (idx === this.suggestIndex)
+      if (i === this.suggestIndex) {
         item.addClass("is-selected");
-      item.createEl("span", { text: cmd.name, cls: "wikicodian-suggest-name" });
-      item.createEl("span", { text: cmd.desc, cls: "wikicodian-suggest-desc" });
+        setTimeout(() => item.scrollIntoView({ block: "nearest", behavior: "smooth" }), 50);
+      }
+      item.createSpan({ text: cmd.name, cls: "wikicodian-suggest-name" });
+      item.createSpan({ text: cmd.desc, cls: "wikicodian-suggest-desc" });
       item.onclick = () => {
-        this.executeSlashCommand(cmd.name);
-        this.inputEl.value = "";
-        this.hideSuggest();
+        this.inputEl.value = cmd.name + " ";
+        this.suggestContainer.style.display = "none";
+        this.inputEl.focus();
       };
     });
   }
+  updateWikiUI() {
+    this.wikiStatusEl.empty();
+    const dot = this.wikiStatusEl.createEl("span", { cls: "wikicodian-status-dot" });
+    dot.style.background = this.settings.wikiEnabled ? "#a371f7" : "#888";
+    this.wikiStatusEl.createSpan({ text: this.settings.wikiEnabled ? "\u4E13\u5BB6\u6A21\u578B: ON" : "\u4E13\u5BB6\u6A21\u578B: OFF" });
+  }
+  async appendMessage(role, text) {
+    const msgEl = this.messageContainer.createEl("div", { cls: `wikicodian-message wikicodian-message-${role}` });
+    if (role === "user") {
+      msgEl.setText(text);
+    } else {
+      msgEl.addClass("markdown-rendered");
+      await import_obsidian.MarkdownRenderer.renderMarkdown(text, msgEl, "", this);
+    }
+    this.messageContainer.scrollTo(0, this.messageContainer.scrollHeight);
+    return msgEl;
+  }
   async executeSlashCommand(cmd) {
-    if (cmd === "/reset") {
-      this.messages = [];
-      this.messageContainer.empty();
-      this.appendMessage("bot", "### \u{1F504} \u5BF9\u8BDD\u5DF2\u91CD\u7F6E");
-      return;
-    }
-    if (cmd.startsWith("/mode ")) {
-      const newMode = cmd.split(" ")[1];
-      if (["auto", "plan", "wiki_only", "general_only", "build"].includes(newMode)) {
-        this.chatMode = newMode;
-        const sel = this.containerEl.querySelector(".wikicodian-mode-select");
-        if (sel)
-          sel.value = newMode;
-        this.appendMessage("bot", `\u2705 \u5DF2\u5728\u524D\u7AEF\u5207\u6362\u6A21\u5F0F: \`${newMode}\``);
-        return;
-      }
-    }
-    let backendCmd = cmd;
-    if (this.currentActiveFile && this.app.vault.adapter instanceof import_obsidian.FileSystemAdapter) {
-      const p = this.app.vault.adapter.getFullPath(this.currentActiveFile.path);
-      backendCmd += ` --file "${p}"`;
-    }
-    this.appendMessage("user", cmd);
+    await this.appendMessage("user", cmd);
     try {
       const res = await (0, import_obsidian.requestUrl)({
         url: `${this.settings.serverUrl}/v1/exec`,
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command: backendCmd })
+        body: JSON.stringify({
+          command: cmd,
+          history: this.messages.slice(-10)
+        })
       });
-      if (res.status === 200) {
-        const output = res.json.output || "\u6267\u884C\u6210\u529F";
-        this.appendMessage("bot", output);
-        this.messages.push({ q: backendCmd, a: output });
-        if (output.includes("FILE_PATH:")) {
-          const lines = output.split("\n");
-          for (const line of lines) {
-            if (line.startsWith("FILE_PATH:")) {
-              const absPath = line.replace("FILE_PATH:", "").trim();
-              this.openExternalOrLocalFile(absPath);
-            }
-          }
+      const data = res.json;
+      await this.appendMessage("bot", data.output || "\u6267\u884C\u6210\u529F");
+      if (data.history && Array.isArray(data.history)) {
+        this.messages = data.history.map((h) => ({ q: h[0], a: h[1] }));
+        this.messageContainer.empty();
+        for (const h of data.history) {
+          await this.appendMessage("user", h[0]);
+          await this.appendMessage("bot", h[1]);
         }
       }
+      if (data.mode) {
+        this.chatMode = data.mode;
+        this.modeSelect.value = data.mode;
+      }
+      if (cmd.startsWith("/reset")) {
+        this.messages = [];
+        this.messageContainer.empty();
+        await this.appendMessage("bot", "\u{1F9F9} \u4F1A\u8BDD\u5DF2\u91CD\u7F6E\u3002");
+      }
     } catch (e) {
-      this.appendMessage("bot", "### \u274C \u6267\u884C\u5931\u8D25");
+      await this.appendMessage("bot", "### \u274C \u6267\u884C\u5931\u8D25\n\u8BF7\u68C0\u67E5\u540E\u7AEF\u8FDE\u63A5\u6216\u6307\u4EE4\u8BED\u6CD5\u3002");
     }
-  }
-  async openExternalOrLocalFile(absPath) {
-    const adapter = this.app.vault.adapter;
-    const vaultPath = (adapter.basePath || "").replace(/\\/g, "/");
-    const normalizedAbs = absPath.replace(/\\/g, "/");
-    if (normalizedAbs.startsWith(vaultPath)) {
-      const relativePath = normalizedAbs.slice(vaultPath.length).replace(/^\//, "");
-      const file = this.app.vault.getAbstractFileByPath(relativePath);
-      if (file instanceof import_obsidian.TFile) {
-        this.app.workspace.getLeaf(true).openFile(file);
-        new import_obsidian.Notice(`\u5DF2\u6253\u5F00\u6587\u4EF6: ${file.name}`);
-      }
-    } else {
-      if (window.electron) {
-        window.electron.remote.shell.openPath(absPath);
-      }
-    }
-  }
-  appendMessage(role, text) {
-    const cleanText = text.split("\n").filter((l) => !l.startsWith("FILE_PATH:")).join("\n");
-    const msgEl = this.messageContainer.createEl("div", { cls: `wikicodian-message wikicodian-message-${role}` });
-    if (role === "user")
-      msgEl.setText(cleanText);
-    else
-      import_obsidian.MarkdownRenderer.renderMarkdown(cleanText, msgEl, "", this);
-    this.messageContainer.scrollTo(0, this.messageContainer.scrollHeight);
-    return msgEl;
   }
 };
 var WikicodianPlugin = class extends import_obsidian.Plugin {
@@ -519,36 +427,9 @@ var WikicodianPlugin = class extends import_obsidian.Plugin {
   }
   async onload() {
     await this.loadSettings();
-    this.registerView(VIEW_TYPE_WIKICODIAN, (leaf) => new WikicodianView(leaf, this.settings));
+    this.registerView(VIEW_TYPE_WIKICODIAN, (leaf) => new WikicodianView(leaf, this));
     this.addRibbonIcon("bot", "Wikicodian Chat", () => this.activateView());
-    this.addCommand({
-      id: "wikicoder-convert-to-canvas",
-      name: "WikiCoder: Convert current file to Canvas (Regex)",
-      callback: () => this.runCanvasConversion(false)
-    });
-    this.addCommand({
-      id: "wikicoder-convert-to-canvas-ai",
-      name: "WikiCoder: Convert current file to Canvas (AI)",
-      callback: () => this.runCanvasConversion(true)
-    });
     this.addSettingTab(new WikicodianSettingTab(this.app, this));
-  }
-  async runCanvasConversion(useAi) {
-    var _a, _b;
-    const activeFile = this.app.workspace.getActiveFile();
-    if (!activeFile || activeFile.extension !== "md") {
-      new import_obsidian.Notice("\u8BF7\u5148\u6253\u5F00\u4E00\u4E2A Markdown \u6587\u4EF6");
-      return;
-    }
-    const view = (_a = this.app.workspace.getLeavesOfType(VIEW_TYPE_WIKICODIAN)[0]) == null ? void 0 : _a.view;
-    if (!view) {
-      await this.activateView();
-    }
-    const cmd = useAi ? `/md2canvas_ai ${activeFile.path}` : `/md2canvas ${activeFile.path}`;
-    const finalView = (_b = this.app.workspace.getLeavesOfType(VIEW_TYPE_WIKICODIAN)[0]) == null ? void 0 : _b.view;
-    if (finalView) {
-      finalView.executeSlashCommand(cmd);
-    }
   }
   async activateView() {
     const { workspace } = this.app;
@@ -579,10 +460,51 @@ var WikicodianSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.createEl("h2", { text: "WikiCoder \u63D2\u4EF6\u8BBE\u7F6E" });
     new import_obsidian.Setting(containerEl).setName("Backend URL").addText((text) => text.setValue(this.plugin.settings.serverUrl).onChange(async (v) => {
       this.plugin.settings.serverUrl = v;
       await this.plugin.saveSettings();
     }));
+    new import_obsidian.Setting(containerEl).setName("\u68C0\u7D22\u8D44\u6599\u6761\u6570").setDesc("WikiAgent \u6BCF\u6B21\u5BF9\u8BDD\u53C2\u8003\u7684\u8D44\u6599\u6DF1\u5EA6 (\u9ED8\u8BA4 8)").addSlider((slider) => slider.setLimits(1, 20, 1).setValue(this.plugin.settings.agentSearchLimit).onChange(async (v) => {
+      this.plugin.settings.agentSearchLimit = v;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("\u5F3A\u5236\u52A0\u6743\u8BCD\u5E93").setDesc("\u4EE5\u9017\u53F7\u5206\u9694\uFF0C\u547D\u4E2D\u8FD9\u4E9B\u8BCD\u7684\u6587\u4EF6\u5C06\u4F18\u5148\u5C55\u793A").addText((text) => text.setValue(this.plugin.settings.boostTerms).onChange(async (v) => {
+      this.plugin.settings.boostTerms = v;
+      await this.plugin.saveSettings();
+    }));
+    const templateSetting = new import_obsidian.Setting(containerEl).setName("\u62A5\u544A\u5408\u6210\u6A21\u677F").setDesc("\u6307\u5B9A AI \u751F\u6210\u6700\u7EC8\u62A5\u544A\u65F6\u4F7F\u7528\u7684\u6A21\u677F (\u81EA\u52A8\u4ECE\u540E\u7AEF\u540C\u6B65)");
+    templateSetting.addDropdown(async (dropdown) => {
+      dropdown.addOption(this.plugin.settings.reportTemplate, "\u{1F504} \u6B63\u5728\u540C\u6B65\u6A21\u677F...");
+      try {
+        const res = await (0, import_obsidian.requestUrl)({
+          url: `${this.plugin.settings.serverUrl}/v1/templates`,
+          method: "GET"
+        });
+        if (res.json && res.json.templates) {
+          const selectEl = dropdown.selectEl;
+          selectEl.empty();
+          res.json.templates.forEach((t) => {
+            dropdown.addOption(t.id, t.name);
+          });
+          if (!this.plugin.settings.reportTemplate || this.plugin.settings.reportTemplate === "business_audit.md") {
+            this.plugin.settings.reportTemplate = res.json.default;
+          }
+          dropdown.setValue(this.plugin.settings.reportTemplate);
+        }
+      } catch (e) {
+        console.error("Failed to sync templates:", e);
+        const selectEl = dropdown.selectEl;
+        selectEl.empty();
+        dropdown.addOption("business_audit.md", "Business Audit (Fallback)");
+        dropdown.setValue("business_audit.md");
+      }
+      dropdown.onChange(async (v) => {
+        this.plugin.settings.reportTemplate = v;
+        await this.plugin.saveSettings();
+        new import_obsidian.Notice(`\u{1F4CB} \u5DF2\u5207\u6362\u6A21\u677F\u4E3A: ${v}`);
+      });
+    });
   }
 };
 module.exports = __toCommonJS(main_exports);

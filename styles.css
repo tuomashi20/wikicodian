@@ -301,3 +301,45 @@
 .wikicodian-yolo-btn:hover {
   background-color: rgba(255, 87, 34, 0.1);
 }
+
+/* 思考气泡样式 - 灵动岛风格 */
+.wikicodian-thought-bubble {
+  font-size: 11px;
+  color: var(--text-normal); /* 提亮颜色 */
+  background: var(--background-secondary-alt); /* 增强对比背景 */
+  padding: 8px 14px;
+  border-radius: 8px;
+  display: block;
+  margin-bottom: 10px;
+  border: 1px solid var(--interactive-accent); /* 强调边框 */
+  max-width: 100%;
+}
+
+.wikicodian-thought-step {
+  margin-bottom: 4px;
+  opacity: 1; /* 全不透明 */
+  line-height: 1.4;
+  animation: wikicodian-fade-in 0.3s ease-out;
+}
+
+@keyframes wikicodian-fade-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 0.8; transform: translateY(0); }
+}
+
+@keyframes wikicodian-pulse {
+  0% { opacity: 0.7; }
+  50% { opacity: 1; }
+  100% { opacity: 0.7; }
+}
+
+.wikicodian-wiki-status {
+  font-size: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 2px 6px;
+  background: var(--background-modifier-hover);
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+}
